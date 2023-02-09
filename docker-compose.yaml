@@ -1,0 +1,135 @@
+version: '3'
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.0.1
+  environment:
+    &airflow-common-env
+    HOST_ENV: ${HOST_ENV:-localhost}
+    AIRFLOW_UID: ${AIRFLOW_UID}
+    AIRFLOW_GID: ${AIRFLOW_GID}
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-database/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-database/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@airflow-broker:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  volumes:
+    # Airflow mounts
+    - type: bind
+      source: ./source-code/dags
+      target: /opt/airflow/dags
+    - type: bind
+      source: ./setup-airflow-pdi/plugins
+      target: /opt/airflow/plugins
+    - type: bind
+      source: ./setup-airflow-pdi/logs/airflow
+      target: /opt/airflow/logs
+    - type: bind
+      source: ./setup-airflow-pdi/airflow.cfg
+      target: /opt/airflow/airflow.cfg
+    # Pdi mounts
+    - type: bind
+      source: ./source-code/ktrs
+      target: /opt/airflow/ktrs
+    - type: bind
+      source: ./setup-airflow-pdi/logs/pdi
+      target: /opt/airflow/data-integration/logs
+    - type: bind
+      source: ./setup-airflow-pdi/kettle-properties/${HOST_ENV:-localhost}-kettle.properties
+      target: /opt/airflow/data-integration/.kettle/kettle.properties
+    - type: bind
+      source: ./setup-airflow-pdi/simple-jndi
+      target: /opt/airflow/data-integration/simple-jndi
+
+
+services:
+# Airflow-DB
+  airflow-database:
+    image: postgres:13
+    container_name: airflow-database
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+# Airflow-messenger
+  airflow-broker:
+    image: redis:latest
+    container_name: airflow-broker
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+    restart: always
+
+# Airflow-webserver
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    depends_on:
+      airflow-database:
+        condition: service_healthy
+    ports:
+      - ${AIRFLOW_HOST_PORT:-8080}:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:${AIRFLOW_HOST_PORT:-8080}/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    command: webserver
+    restart: always
+
+# Airflow-scheduler
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-broker:
+        condition: service_healthy
+      airflow-database:
+        condition: service_healthy
+    command: scheduler
+    restart: always
+
+# Airflow-DB-initialize
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@admin.com}
+    depends_on:
+      airflow-database:
+        condition: service_healthy
+    command: version
+
+# Airflow-worker
+  airflow-worker:
+    <<: *airflow-common
+    build:
+      context: ./setup-airflow-pdi
+    image: airflow-pdi
+    environment:
+      <<: *airflow-common-env
+      PENTAHO_DI_JAVA_OPTIONS: ${PENTAHO_DI_JAVA_OPTIONS}
+    command: celery worker
+    restart: always
+
+volumes:
+  postgres-db-volume:
